@@ -3,7 +3,7 @@ export const config = { runtime: "nodejs20.x" };
 // ---------- POSTNL SCRAPER ----------
 async function scrapePostNL(code) {
   try {
-    const url = `https://jouw.postnl.nl/track-and-trace/api/track?barcode=${code}`;
+    const url = `https://jouw.postnl.nl/track-and-trace/api/track?barcode=${code}`; 
     const res = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0",
