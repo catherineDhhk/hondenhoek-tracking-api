@@ -28,10 +28,39 @@ async function scrapePostNL(code) {
       return { status: "verzonden", deliveredDate: null };
     }
 
-    return { status: "unknown", deliveredDate: null };
-  } catch (e) {
-    return { status: "unknown", deliveredDate: null };
+if (result.status === "unknown") {
+  const fDate = new Date(fulfillment.created_at);
+  const fw = fallbackWindow(fDate);
+
+  // Minder dan 48 uur na verzending → status wordt bijgewerkt
+  const hoursSince = (Date.now() - fDate.getTime()) / 36e5;
+
+  if (hoursSince < 48) {
+    return res.json({
+      order_number: clean,
+      customer_name:
+        `${o.customer.first_name} ${o.customer.last_name}`,
+      items: o.line_items,
+      tracking,
+      carrier,
+      status: "verzonden-wachten",
+      expected: "Trackinginformatie wordt binnen 24–48 uur bijgewerkt"
+    });
   }
+
+  // Meer dan 48 uur → eco-levering tonen
+  return res.json({
+    order_number: clean,
+    customer_name:
+      `${o.customer.first_name} ${o.customer.last_name}`,
+    items: o.line_items,
+    tracking,
+    carrier,
+    status: "onderweg",
+    expected: `Eco levering tussen ${fw.start} en ${fw.end}`
+  });
+}
+
 }
 
 async function scrapeBpost(code) {
