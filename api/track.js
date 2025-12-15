@@ -22,7 +22,6 @@ async function scrapePostNL(code) {
 
     const phase = data.phase ?? "UNKNOWN";
 
-    // TIJDSLOT (wanneer beschikbaar)
     let day = null;
     let window = null;
 
@@ -47,7 +46,6 @@ async function scrapePostNL(code) {
         end.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit" });
     }
 
-    // STATUS MAPPEN
     if (phase === "DELIVERED")
       return {
         status: "bezorgd",
@@ -73,13 +71,13 @@ async function scrapePostNL(code) {
       };
 
     return { status: "unknown" };
-  } catch (e) {
+  } catch {
     return { status: "unknown" };
   }
 }
 
 /* -------------------------
-   BPOST SCRAPER (vereenvoudigd)
+   BPOST SCRAPER
 -------------------------- */
 async function scrapeBpost(code) {
   try {
@@ -88,23 +86,22 @@ async function scrapeBpost(code) {
     const json = await res.json();
 
     const phase = json?.item?.status?.phase;
-
     if (phase === "DELIVERED")
       return {
         status: "bezorgd",
         deliveredDate: json.item.status.date ?? null,
       };
 
-    if (phase) return { status: "onderweg", deliveredDate: null };
+    if (phase) return { status: "onderweg" };
 
     return { status: "unknown" };
-  } catch (e) {
+  } catch {
     return { status: "unknown" };
   }
 }
 
 /* -------------------------
-   LEVERINGSVENSTER FALLBACK (4–7 werkdagen)
+   FALLBACK 4–7 werkdagen
 -------------------------- */
 function fallbackWindow(date) {
   const start = new Date(date);
@@ -124,7 +121,6 @@ function fallbackWindow(date) {
 ============================================================================ */
 
 export default async function handler(req, res) {
-  // --- CORS FIX ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -138,13 +134,13 @@ export default async function handler(req, res) {
     const clean = order.replace("#", "").trim().toUpperCase();
 
     /* -------------------------
-       SHOPIFY CALL
+       SHOPIFY FETCH
     -------------------------- */
     const shop = process.env.SHOPIFY_DOMAIN;
     const token = process.env.SHOPIFY_TOKEN;
 
     const shopRes = await fetch(
-      `https://${shop}/admin/api/2024-10/orders.json?status=any&limit=30`,
+      `https://${shop}/admin/api/2024-10/orders.json?status=any&limit=50`,
       {
         headers: {
           "X-Shopify-Access-Token": token,
@@ -173,29 +169,38 @@ export default async function handler(req, res) {
     }
 
     /* -------------------------
-       TRACKING
+       FULFILLMENT CHECK
     -------------------------- */
+
     const fulfillment = o.fulfillments?.[0] ?? null;
     const tracking = fulfillment?.tracking_number ?? null;
 
-    if (!tracking) {
-      // eco fallback
-      const win = fallbackWindow(o.created_at);
+    // 🟡 CASE 1 — Helemaal geen fulfillment → bestelling nog NIET verwerkt
+    if (!fulfillment) {
       return res.json({
         order_number: clean,
         customer_name: `${o.customer.first_name} ${o.customer.last_name}`,
         items: o.line_items,
-        status: "verzonden",
-        expected: {
-          start: win.start,
-          end: win.end,
-        },
+        status: "besteld",
+        expected: null,
+      });
+    }
+
+    // 🟡 CASE 2 — Fulfillment bestaat maar geen tracking → "verwerkt"
+    if (fulfillment && !tracking) {
+      return res.json({
+        order_number: clean,
+        customer_name: `${o.customer.first_name} ${o.customer.last_name}`,
+        items: o.line_items,
+        status: "verwerkt",
+        expected: "Uw bestelling wordt klaargemaakt voor verzending.",
       });
     }
 
     /* -------------------------
-       CARRIER DETECTIE
+       TRACKING SCRAPE
     -------------------------- */
+
     let carrier = "onbekend";
     let result = { status: "unknown" };
 
@@ -203,7 +208,6 @@ export default async function handler(req, res) {
       carrier = "postnl";
       result = await scrapePostNL(tracking);
 
-      // fallback naar Bpost
       if (result.status === "unknown") {
         const bp = await scrapeBpost(tracking);
         if (bp.status !== "unknown") {
@@ -217,12 +221,11 @@ export default async function handler(req, res) {
     }
 
     /* -------------------------
-       UNKNOWN CASE
+       UNKNOWN HANDLING
     -------------------------- */
+
     if (result.status === "unknown") {
-      const fDate = fulfillment?.created_at
-        ? new Date(fulfillment.created_at)
-        : new Date(o.created_at);
+      const fDate = new Date(fulfillment.created_at);
 
       const hoursSince = (Date.now() - fDate.getTime()) / 36e5;
 
@@ -256,8 +259,9 @@ export default async function handler(req, res) {
     }
 
     /* -------------------------
-       SUCCESS CASE — TIJDSLOT MEEGEVEN
+       SUCCESS CASE
     -------------------------- */
+
     return res.json({
       order_number: clean,
       customer_name: `${o.customer.first_name} ${o.customer.last_name}`,
@@ -266,11 +270,10 @@ export default async function handler(req, res) {
       carrier,
       status: result.status,
       deliveredDate: result.deliveredDate ?? null,
-
-      // NIEUW:
       delivery_day: result.delivery_day ?? null,
       delivery_window: result.delivery_window ?? null,
     });
+
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
