@@ -1,9 +1,12 @@
 export const config = { runtime: "nodejs" };
 
-/* -------------------------
-   HELPERS
--------------------------- */
+/* ============================================================================
+   1) HELPERS
+============================================================================ */
 
+/* -------------------------
+   POSTNL SCRAPER (incl. tijdslot)
+-------------------------- */
 async function scrapePostNL(code) {
   try {
     const url = `https://jouw.postnl.nl/track-and-trace/api/track?barcode=${code}`;
@@ -15,20 +18,69 @@ async function scrapePostNL(code) {
     });
 
     const data = await res.json();
-    if (!data || !data.phase) return { status: "unknown", deliveredDate: null };
+    if (!data) return { status: "unknown" };
 
-    if (data.phase === "DELIVERED")
-      return { status: "bezorgd", deliveredDate: data.deliveryDate ?? null };
+    const phase = data.phase ?? "UNKNOWN";
 
-    if (data.phase === "IN_TRANSPORT") return { status: "onderweg", deliveredDate: null };
-    if (data.phase === "COLLECTED") return { status: "verzonden", deliveredDate: null };
+    // TIJDSLOT (wanneer beschikbaar)
+    let day = null;
+    let window = null;
 
-    return { status: "unknown", deliveredDate: null };
+    if (data?.timeFrame?.start && data?.timeFrame?.end) {
+      const start = new Date(data.timeFrame.start);
+      const end = new Date(data.timeFrame.end);
+
+      const dayNames = [
+        "zondag",
+        "maandag",
+        "dinsdag",
+        "woensdag",
+        "donderdag",
+        "vrijdag",
+        "zaterdag",
+      ];
+
+      day = dayNames[start.getDay()];
+      window =
+        start.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit" }) +
+        " – " +
+        end.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit" });
+    }
+
+    // STATUS MAPPEN
+    if (phase === "DELIVERED")
+      return {
+        status: "bezorgd",
+        deliveredDate: data.deliveryDate ?? null,
+        delivery_day: day,
+        delivery_window: window,
+      };
+
+    if (phase === "IN_TRANSPORT")
+      return {
+        status: "onderweg",
+        deliveredDate: null,
+        delivery_day: day,
+        delivery_window: window,
+      };
+
+    if (phase === "COLLECTED")
+      return {
+        status: "verzonden",
+        deliveredDate: null,
+        delivery_day: day,
+        delivery_window: window,
+      };
+
+    return { status: "unknown" };
   } catch (e) {
-    return { status: "unknown", deliveredDate: null };
+    return { status: "unknown" };
   }
 }
 
+/* -------------------------
+   BPOST SCRAPER (vereenvoudigd)
+-------------------------- */
 async function scrapeBpost(code) {
   try {
     const url = `https://api.bpost.cloud/track/items?itemIdentifier=${code}`;
@@ -36,17 +88,24 @@ async function scrapeBpost(code) {
     const json = await res.json();
 
     const phase = json?.item?.status?.phase;
-    if (!phase) return { status: "unknown", deliveredDate: null };
 
     if (phase === "DELIVERED")
-      return { status: "bezorgd", deliveredDate: json.item.status.date ?? null };
+      return {
+        status: "bezorgd",
+        deliveredDate: json.item.status.date ?? null,
+      };
 
-    return { status: "onderweg", deliveredDate: null };
+    if (phase) return { status: "onderweg", deliveredDate: null };
+
+    return { status: "unknown" };
   } catch (e) {
-    return { status: "unknown", deliveredDate: null };
+    return { status: "unknown" };
   }
 }
 
+/* -------------------------
+   LEVERINGSVENSTER FALLBACK (4–7 werkdagen)
+-------------------------- */
 function fallbackWindow(date) {
   const start = new Date(date);
   const end = new Date(date);
@@ -60,12 +119,12 @@ function fallbackWindow(date) {
   };
 }
 
-/* -------------------------
-   MAIN HANDLER
--------------------------- */
+/* ============================================================================
+   2) MAIN HANDLER
+============================================================================ */
 
 export default async function handler(req, res) {
-  // CORS FIX — hoort bovenaan!
+  // --- CORS FIX ---
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -78,6 +137,9 @@ export default async function handler(req, res) {
 
     const clean = order.replace("#", "").trim().toUpperCase();
 
+    /* -------------------------
+       SHOPIFY CALL
+    -------------------------- */
     const shop = process.env.SHOPIFY_DOMAIN;
     const token = process.env.SHOPIFY_TOKEN;
 
@@ -102,7 +164,6 @@ export default async function handler(req, res) {
 
     if (!o) return res.status(404).json({ error: "Geen bestelling gevonden." });
 
-    // E-mail check
     const mail = email.toLowerCase();
     if (
       o.email?.toLowerCase() !== mail &&
@@ -111,24 +172,32 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: "E-mailadres komt niet overeen." });
     }
 
+    /* -------------------------
+       TRACKING
+    -------------------------- */
     const fulfillment = o.fulfillments?.[0] ?? null;
     const tracking = fulfillment?.tracking_number ?? null;
 
-    // Geen tracking = eco fallback (op basis van besteldatum)
     if (!tracking) {
+      // eco fallback
       const win = fallbackWindow(o.created_at);
       return res.json({
         order_number: clean,
         customer_name: `${o.customer.first_name} ${o.customer.last_name}`,
         items: o.line_items,
         status: "verzonden",
-        expected: `Levering tussen ${win.start} en ${win.end}`,
+        expected: {
+          start: win.start,
+          end: win.end,
+        },
       });
     }
 
-    // Bepaal carrier
+    /* -------------------------
+       CARRIER DETECTIE
+    -------------------------- */
     let carrier = "onbekend";
-    let result = null;
+    let result = { status: "unknown" };
 
     if (tracking.endsWith("NL")) {
       carrier = "postnl";
@@ -145,11 +214,11 @@ export default async function handler(req, res) {
     } else if (tracking.endsWith("BE")) {
       carrier = "bpost";
       result = await scrapeBpost(tracking);
-    } else {
-      result = { status: "unknown", deliveredDate: null };
     }
 
-    // Unknown → verzonden-wachten (0–48h) → eco fallback (>48h)
+    /* -------------------------
+       UNKNOWN CASE
+    -------------------------- */
     if (result.status === "unknown") {
       const fDate = fulfillment?.created_at
         ? new Date(fulfillment.created_at)
@@ -165,7 +234,9 @@ export default async function handler(req, res) {
           tracking,
           carrier,
           status: "verzonden-wachten",
-          expected: "Trackinginformatie wordt binnen 24–48 uur bijgewerkt",
+          expected: {
+            message: "Eerste trackingupdate wordt binnen 24–48 uur verwacht.",
+          },
         });
       }
 
@@ -177,11 +248,16 @@ export default async function handler(req, res) {
         tracking,
         carrier,
         status: "onderweg",
-        expected: `Levering tussen ${win.start} en ${win.end}`,
+        expected: {
+          start: win.start,
+          end: win.end,
+        },
       });
     }
 
-    // Normaal antwoord
+    /* -------------------------
+       SUCCESS CASE — TIJDSLOT MEEGEVEN
+    -------------------------- */
     return res.json({
       order_number: clean,
       customer_name: `${o.customer.first_name} ${o.customer.last_name}`,
@@ -190,8 +266,11 @@ export default async function handler(req, res) {
       carrier,
       status: result.status,
       deliveredDate: result.deliveredDate ?? null,
-    });
 
+      // NIEUW:
+      delivery_day: result.delivery_day ?? null,
+      delivery_window: result.delivery_window ?? null,
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
